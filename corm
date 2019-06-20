@@ -1,0 +1,522 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use DBI;
+use File::Basename qw(basename dirname);
+use POSIX qw(strftime);
+use Getopt::Long
+    qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
+
+sub usage;
+sub fatal;
+
+my $root = '/var/local/coral';
+my $phase = 'prod';
+my %ok;
+my %is_module = map { $_ => 1 } qw(auth licensing organizations reports resources terms usage);
+my %module2dbfrag = map { $_ => $_ } keys %is_module;
+$module2dbfrag{'reports'} = 'reporting';
+$module2dbfrag{'terms'} = 'licensing';
+
+usage if !@ARGV;
+&{ __PACKAGE__->can('cmd_'.shift) || usage };
+
+sub cmd_db {
+    if (@ARGV) {
+        my $inst = opt_instance();
+        my $mod  = opt_module($inst);
+        my $dbname = dbname($inst, $mod);
+        exec qw(mysql -u coral), '-p'.password($inst), $dbname
+            or die;
+    }
+    else {
+        exec qw(mysql -u coral), '-p'.password('sandbox'), dbname('sandbox', 'resources')
+            or die;
+    }
+}
+
+sub cmd_dbq {
+    my $inst = opt_instance();
+    my $mod  = opt_module($inst);
+    my $dbh = dbh($inst, $mod, undef, undef, "coral_${inst}_${mod}_${phase}");
+    my ($sql, @params);
+    orient(
+        's|sql=s' => \$sql,
+        'p|param=s' => \@params,
+    );
+    if (!defined $sql) {
+        if (@ARGV == 1) {
+            ($sql) = @ARGV;
+        }
+        elsif (@ARGV = 0 && !-t STDIN) {
+            local $/;
+            $sql = <STDIN>;
+        }
+        else {
+            usage;
+        }
+    }
+    my $sth = $dbh->prepare($sql);
+    $sth->execute(@params);
+    while (my @row = $sth->fetchrow_array) {
+        print join("\t", map { defined $_ ? $_ : '' } @row), "\n";
+    }
+}
+
+sub cmd_down {
+    my $inst = opt_instance();
+    rename "$root/$inst", "$root/$inst,down" or die "rename $inst $inst,down: $!";
+}
+
+sub cmd_up {
+    my $inst = opt_instance();
+    rename "$root/$inst,down", "$root/$inst" or die "rename $inst,down $inst: $!";
+}
+
+sub cmd_status {
+    my $inst = opt_instance();
+    if (-e "$root/$inst,down") {
+        print STDERR "down: $inst\n";
+    }
+    elsif (-e "$root/$inst") {
+        print STDERR "up: $inst\n";
+    }
+}
+
+sub cmd_li { goto &cmd_instances }
+sub cmd_instances {
+    print $_, "\n" for instances();
+}
+
+sub cmd_modules {
+    my $inst = opt_instance();
+    print $_, "\n" for modules($inst);
+}
+
+sub cmd_dump {
+    my ($schema);
+    orient(
+        's|schema' => \$schema,
+    );
+    my $inst = opt_instance();
+    my $mod  = opt_module($inst);
+    my $dbname = dbname($inst, $mod);
+    exec qw(mysqldump -u coral),
+        ($schema ? ('-d') : ()),
+        '-p'.password($inst), $dbname, @ARGV
+        or die;
+}
+
+sub cmd_copy {
+    # usage: corm copy INSTANCE [DESTDIR]
+    my $dircopy;
+    my $inst = opt_instance();
+    $dircopy = shift @ARGV if @ARGV;
+    my @modules = modules($inst);
+    my $timestamp = strftime('%Y%m%dT%H%M%S', localtime);
+    my $dir = instance_dir($inst);
+    $dircopy ||= instance_dir("${inst}_copy${timestamp}");
+    my $password = ask_password('MySQL root password:');
+    die "Cancelled\n" if !defined $password;
+    system("mysql -u root '-p$password' < /dev/null") == 0
+        or die "Wrong password?\n";
+    print STDERR "rsync -a $dir/ $dircopy/\n";
+    mkdir $dircopy or die "mkdir $dircopy: $!";
+    system(qw(rsync -a), "$dir/", "$dircopy/") == 0
+        or die "rsync: $!";
+    my %copied;
+    foreach my $mod (@modules) {
+        my $dbname = dbname($inst, $mod) or next;
+        my $dbcopy = dbname($inst, $mod, "copy$timestamp");
+        print STDERR "    $mod : ";
+        if (!$copied{$dbname}++) {
+            system('bin/cpdb', $dbname, $dbcopy, $password) == 0
+                or die;
+        }
+        my $config = dbconfig($inst, $dir, $mod);
+        dbconfig($inst, $dir, $mod, $config, $timestamp);
+    }
+    print STDERR "URL: http://coral.flo.org/${inst}_copy${timestamp}/\n";
+}
+
+sub cmd_subend {
+    my $include_nulls;  # Include NULL subscription end dates
+    my $sort = 'currentEndDate';
+    my @cmd = qw(mysql);
+    my @criteria;
+    my @cols;
+    my @dates;
+    orient(
+        'n|null' => sub { push @criteria, "currentEndDate IS NOT NULL" },
+        'H|no-header' => sub { push @cmd, '-N' },
+        'c|columns=s' => sub { push @cols, split /[,\s]+/, $_[1] },
+        'd|date=s' => sub { push @dates, split /[,\s]+/, $_[1] },
+        'D|delta' => sub { push @cols, 'DATEDIFF(currentEndDate, DATE(NOW()))' },
+        'e|end-date' => sub { push @cols, 'currentEndDate' },
+        'r|resource-id' => sub { push @cols, 'resourceID' },
+        'f|future-only' => sub { push @criteria, 'currentEndDate > DATE(NOW())' },
+        'u|no-sort' => sub { undef $sort },
+    );
+    my $inst = opt_instance();
+    my $mod = 'resources';
+    if (@ARGV) {
+        usage if grep { !/^[0-9]+$/ } @ARGV;
+        push @criteria, sprintf "resourceID IN ( %s )", join(', ', @ARGV);
+    }
+    @cols = qw(currentEndDate resourceID) if !@cols;
+    my $dbname = dbname($inst, $mod);
+    open my $fh, '|-', @cmd, qw(-u coral), '-p'.password($inst), $dbname
+        or die;
+    my $sql = sprintf "SELECT %s\nFROM   Resource\n", join(', ', @cols);
+    if (@dates) {
+        my @date_criteria;
+        foreach (@dates) {
+            if (/^([0-9]{4})-?([0-9]{2})-?([0-9]{2})$/) {
+                push @date_criteria, "currentEndDate = '$1-$2-$3'";
+            }
+            elsif (/^[+]?([0-9]+)([d]?)$/) {
+                # Advance notice
+                push @date_criteria, "DATEDIFF(currentEndDate, NOW()) = $1";
+            }
+            else {
+                usage;
+            }
+        }
+        push @criteria, sprintf '( %s )', join(' OR ', @date_criteria);
+    }
+    if (@criteria) {
+        $sql .= "WHERE  " . join("\nAND    ", @criteria) . "\n";
+    }
+    $sql .= "ORDER  BY currentEndDate\n" if $sort;
+    print $fh $sql or die;
+    close $fh or die;
+}
+
+sub cmd_subext {
+    my $inst = opt_instance();
+    my $mod = 'resources';
+    usage if @ARGV < 2;
+    my $date = shift @ARGV;
+    usage if $date !~ /^(2[0-9]{3})-?([0-9]{2})-?([0-9]{2})$/;
+    $date = "$1-$2-$3";
+    usage if grep { !/^\d+$/ } @ARGV;
+    my $list = join(', ', @ARGV);
+    my $dbname = dbname($inst, $mod);
+    open my $fh, '|-', qw(mysql -u coral), '-p'.password($inst), $dbname
+        or die;
+    print $fh, <<"EOS" or die;
+UPDATE Resource
+SET    currentEndDate = '$date'
+WHERE  resourceID IN ( $list )
+EOS
+    close $fh or die;
+}
+
+sub cmd_exists {
+    usage if @ARGV < 3;
+    my ($inst, $mod) = splice @ARGV, 0, 2;
+    my ($table, $column, $index);
+    orient(
+        't|table=s' => \$table,
+        'c|column=s' => \$column,
+        'i|index=s' => \$index,
+    ) or usage;
+    my $dbh = dbh($inst, $mod, undef, undef, "coral_${inst}_${mod}_${phase}");
+    if (defined $index) {
+        die "index specified without a table" if !defined $table;
+        my $sql = "SHOW INDEX FROM $table";
+        my $sth = $dbh->prepare($sql);
+        $sth->execute;
+        while (my $h = $sth->fetchrow_hashref) {
+            exit 0 if $h->{'Column_name'} eq $index;
+        }
+        exit 1;
+    }
+    elsif (defined $column) {
+        die "column specified without a table" if !defined $table;
+        my $dbh = dbh_info_schema();
+        my $sql = "SELECT * FROM COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?";
+        my $sth = $dbh->prepare($sql);
+        $sth->execute("coral_${inst}_${mod}_${phase}", $table, $column);
+        if (my @row = $sth->fetchrow_array) {
+            exit 0;
+        }
+        exit 1;
+    }
+    elsif (defined $table) {
+        my $dbh = dbh_info_schema();
+        my $sql = "SELECT * FROM TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+        my $sth = $dbh->prepare($sql);
+        $sth->execute("coral_${inst}_${mod}_${phase}", $table);
+        if (my @row = $sth->fetchrow_array) {
+            exit 0;
+        }
+        exit 1;
+    }
+};
+
+sub cmd_alerts {
+    my $inst = opt_instance();
+    my $mod = 'resources';
+    my $dbh = dbh($inst, $mod, undef, undef, "coral_${inst}_${mod}_${phase}");
+    my @advance = @ARGV ? @ARGV : alert_days_in_advance($dbh);
+    my @email = alert_email_addresses($dbh);
+    @email = ('notices@flo.org') if !@email;
+    my $email = join(', ', @email);
+    my $sql = sprintf q{
+        SELECT  DISTINCT
+                r.resourceID,
+                r.titleText,
+                DATEDIFF(ra.subscriptionEndDate, CURDATE()),
+                ra.subscriptionEndDate
+        FROM    ResourceAcquisition ra,
+                Resource r
+        WHERE   ra.resourceID = r.resourceID
+        AND     ra.subscriptionAlertEnabledInd = '1'
+        AND     DATEDIFF(ra.subscriptionEndDate, CURDATE()) IN (%s)
+    }, join(',', map { '?' } @advance);
+    my $sth = $dbh->prepare($sql);
+    $sth->execute(@advance);
+    while (my ($rid, $title, $days, $date) = $sth->fetchrow_array) {
+        print <<"EOS";
+Type:  SUBSCRIP/END
+To:    $email
+Alert: $days day(s) until subscription ends
+When:  $date
+Title: $title
+URL:   http://coral.flo.org/$inst/resources/resource.php?resourceID=$rid
+
+EOS
+    }
+    $sql = q{
+        SELECT  DISTINCT
+                rs.stepName,
+                r.resourceID,
+                r.titleText
+        FROM    ResourceStep rs,
+                ResourceAcquisition ra,
+                Resource r
+        WHERE   rs.resourceAcquisitionID = ra.resourceAcquisitionID
+        AND     ra.resourceID = r.resourceID
+        AND     DATE_ADD(rs.stepStartDate, INTERVAL rs.mailReminderDelay DAY) BETWEEN DATE_ADD(NOW(), INTERVAL -1 DAY) AND NOW()
+        AND     rs.mailReminderDelay IS NOT NULL
+    };
+    $sth = $dbh->prepare($sql);
+    $sth->execute;
+    while (my ($step, $rid, $title) = $sth->fetchrow_array) {
+        print <<"EOS";
+Type:  WORKFLOW/DUE
+To:    $email
+Alert: Step due: $step
+Title: $title
+URL:   http://coral.flo.org/$inst/resources/resource.php?resourceID=$rid
+
+EOS
+    }
+}
+
+sub alert_email_addresses {
+    my ($dbh) = @_;
+    my $sql = q{
+        SELECT emailAddress FROM AlertEmailAddress
+    };
+    my $sth = $dbh->prepare($sql);
+    my @email;
+    $sth->execute;
+    while (my ($email) = $sth->fetchrow_array) {
+        push @email, $email;
+    }
+    return @email;
+}
+
+sub alert_days_in_advance {
+    my ($dbh) = @_;
+    return qw(30 60 90);  # XXX
+}
+
+sub opt_instance {
+    usage if !@ARGV;
+    my $inst = shift @ARGV;
+    my %ok = map { $_ => 1 } instances();
+    die "Not a CORAL instance: $inst" if !$ok{$inst};
+    return $inst;
+}
+
+sub opt_module {
+    my ($inst) = @_;
+    usage if !@ARGV;
+    my $mod = shift @ARGV;
+    my %ok = map { $_ => 1 } modules($inst);
+    die "Not a module: $mod" if !$ok{$mod};
+    return $mod;
+}
+
+sub instances {
+    my %instance;
+    foreach my $dir (glob("$root/*")) {
+        next if $dir =~ m{/coral-[0-9][^/]*$};
+        next if -l $dir || !-d $dir;
+        (my $inst = $dir) =~ s{.+/|,down$}{}g;
+        $instance{$inst} = $dir if $dir !~ /(?:\.bak|~)$/ && -e "$dir/index.php";
+    }
+    return sort keys %instance;
+    # return sort map { !/(?:\.bak|~)$/ && -e "$_/index.php" && -d $_ ? (basename($_)) : () } @dirs;
+}
+
+sub modules {
+    my ($inst) = @_;
+    my $dir = "$root/$inst";
+    $dir .= ',down' if !-d $dir && -d "$dir,down";
+    my @dirs = map { if (-d) { s/,down$//; $_ } } glob("$dir/*");
+    return sort map { my $b = basename($_); $is_module{$b} && -d $_ ? ($b) : () } @dirs;
+}
+
+sub password {
+    my ($inst) = @_;
+    my $dir = instance_dir($inst);
+    open my $fh, '<', "$dir/auth/admin/configuration.ini" or die;
+    while (<$fh>) {
+        return $1 if /^\s*password\s*=\s*"?([^"]+)"?\s*$/;
+    }
+    die "Can't determine MySQL password for $inst";
+}
+
+sub instance_dir {
+    my ($inst) = @_;
+    my $dir = -d "$root/$inst,down" ? "$root/$inst,down" : "$root/$inst";
+    return $dir;
+}
+
+sub dbconfig {
+    my ($inst, $dir, $mod, $config, $timestamp) = @_;
+    if (!defined $config) {
+        # Read DB config
+        $dir ||= instance_dir($inst);
+        open my $fh, '<', "$dir/auth/admin/configuration.ini" or die;
+        my %config;
+        while (<$fh>) {
+            next if !/^\[database\]/;
+            while (<$fh>) {
+                last if /^\[/;
+                $config{$1} = $2 if /^\s*([^\s=]+)\s*=\s*"?([^"]+)"?\s*$/;
+            }
+        }
+        return \%config;
+    }
+    else {
+        # Write DB config
+        $dir ||= instance_dir("${inst}_copy${timestamp}");
+        my $dbname = dbname($inst, $mod);
+        my $dbcopy = dbname($inst, $mod, "copy$timestamp");
+        my $base = "$dir/$mod/admin/configuration.ini";
+        open my $fhin,  '<', $base or die;
+        open my $fhout, '>', "$base.$timestamp" or die;
+        my %config;
+        while (<$fhin>) {
+            print($fhout $_), next if !/^\[database\]/;
+            my @buf;
+            while (<$fhin>) {
+                if (/^\[/) {
+                    push @buf, $_;
+                    last;
+                }
+                print($fhout $_), next if !/^\s*([^\s=]+)\s*=\s*"?([^"]+)"?\s*$/;
+                $config{$1} = $2;
+            }
+            if (defined $config{'name'}) {
+                $config{'name'} =~ s/_${phase}$/_copy$timestamp/;
+            }
+            else {
+                die "database name not configured? $inst $mod\n";
+            }
+            print $fhout "[database]\n";
+            foreach my $k (keys %config) {
+                printf $fhout qq{%s = "%s"\n}, $k, $config{$k};
+            }
+            print $fhout "\n", @buf;
+        }
+        close $fhin;
+        close $fhout;
+        unlink "$base.old";
+        rename $base, "$base.old" or die "rename $base $base.old: $!";
+        rename "$base.$timestamp", $base or die "rename $base.$timestamp $base: $!";
+    }
+}
+
+sub dbh_info_schema {
+    my $dsn = "DBI:mysql:database=INFORMATION_SCHEMA";
+    return DBI->connect($dsn, 'root', root_password(), {'RaiseError' => 1});
+}
+
+sub root_password {
+    open my $fh, '<', '/root/.mysqlpass' or return undef;
+    my $pass = <$fh>;
+    chomp $pass if defined $pass;
+    return $pass;
+}
+
+sub dbh {
+    my ($inst, $mod, $user, $pass, $name) = @_;
+    my $dir = instance_dir($inst);
+    my $dbconfig = dbconfig($inst, undef, $mod);
+    if ($dbconfig->{'type'} eq 'mysql') {
+        my ($host, $port) = @$dbconfig{qw(host port)};
+        $user ||= $dbconfig->{'username'};
+        $pass ||= $dbconfig->{'password'};
+        $name ||= $dbconfig->{'name'};
+        my $dsn = "DBI:mysql:database=$name;host=$host";
+        $dsn .= ";port=$port" if defined $port;
+        return DBI->connect($dsn, $user, $pass, {'RaiseError' => 1});
+    }
+    die "can't connect to DB for $inst $mod";
+}
+
+sub dbname {
+    my ($inst, $mod, $sfx) = @_;
+    $sfx ||= $phase;
+    my $frag = $module2dbfrag{$mod} or return;
+    return sprintf 'coral_%s_%s_%s', $inst, $frag, $sfx;
+}
+
+sub ask_password {
+    my ($prompt) = @_;
+    print STDERR $prompt;
+    system('stty -echo');
+    my $password = <STDIN>;
+    system('stty echo');
+    chomp $password;
+    print STDERR "\n";
+    return $password;
+}
+
+sub orient {
+    GetOptions(
+        'd|development' => sub { $phase = 'devel' },
+        @_,
+    ) or usage;
+}
+
+sub usage {
+    print STDERR <<'EOS';
+usage: corm COMMAND [ARG...]
+commands:
+  instances                             - list instances
+  modules INSTANCE                      - list modules installed for INSTANCE
+  copy INSTANCE [DESTDIR]               - copy an instance (data and code)
+  db INSTANCE MODULE                    - connect to database
+  dump INSTANCE MODULE                  - dump data
+  subend INSTANCE [RSRCID...]           - print current resource subscription end dates
+  subext INSTANCE YYYY-MM-DD RSRCID...  - extend current resource subscription end dates
+  up|down INSTANCE                      - bring instance up or down
+EOS
+    exit 1;
+}
+
+sub fatal {
+    print STDERR "corm: @_\n";
+    exit 2;
+}
+
+# vim:set ai si ci et ts=4 sw=4:
